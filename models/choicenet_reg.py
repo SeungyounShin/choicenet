@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.loss import MDNLoss,KL
 import numpy as np
+from torch.autograd import Variable
 
 class ChoiceNetRegression(nn.Module):
     def __init__(self,xdim=1, ydim=1,feat_dim=128, k_mix = 5,
@@ -18,10 +19,15 @@ class ChoiceNetRegression(nn.Module):
         self.tau_inv = 1e-2
         # cholesky block
         self.rho = nn.Sequential(nn.Linear(in_features=self.Q, out_features=self.k_mix),
+                                 nn.BatchNorm1d(self.k_mix),
                                  nn.Sigmoid())
         self.pi = nn.Sequential(nn.Linear(in_features=self.Q, out_features=self.k_mix),
+                                nn.BatchNorm1d(self.k_mix),
+                                nn.ReLU(inplace=True),
                                  nn.Softmax(dim=1))
-        self.varOut = nn.Sequential(nn.Linear(in_features=self.Q, out_features=self.ydim))
+        self.varOut = nn.Sequential(nn.Linear(in_features=self.Q, out_features=self.ydim),
+                                    nn.BatchNorm1d(self.ydim),
+                                    nn.ReLU(inplace=True),)
         self.muW = nn.Parameter(torch.zeros(self.Q,ydim))
         self.SigmaW = nn.Parameter(torch.ones(self.Q,ydim))
         self.muZ = torch.zeros(self.Q,ydim)
@@ -48,7 +54,13 @@ class ChoiceNetRegression(nn.Module):
         feat = self.h(x)
         #correlation
         p = self.rho(feat)
-        p[:,0].data = torch.ones_like(p[:,0]).data
+        ixs = torch.arange(self.k_mix, dtype=torch.int64)
+        p = torch.where(ixs[None,:] == 0, torch.tensor(1.), p)
+        #print(p)
+
+        #p_slice = p_tmp[:,0:1]*Variable(torch.tensor([0.]),requires_grad=True) + Variable(torch.tensor([1.]),requires_grad=True)
+        #p = torch.cat([p_slice, p_tmp[:,1:]],axis=1)
+
         #p = torch.cat([p_tmp[:,0:1]*0.0+1., p_tmp[:,1:]],axis=1)
         pi = self.pi(feat) # [N,K]
         #reparametrization
@@ -61,7 +73,7 @@ class ChoiceNetRegression(nn.Module):
             pk = p[:, k:k+1].unsqueeze(-1).repeat(1,self.Q, self.ydim) # [N,Q,D]
             Wk = muW_ +  sigmaW_.sqrt()*torch.randn(N,self.Q,self.ydim) # [N,Q,D]
             Zk = muZ_ + sigmaZ_.sqrt()*torch.randn(N,self.Q, self.ydim) # [N,Q,D]
-            tilda_Wk = pk*muW_ + (1-pk.pow(2))*(pk*torch.sqrt(sigmaZ_)/torch.sqrt(sigmaW_)*(Wk-muW_) + Zk*torch.sqrt(1-pk.pow(2)))
+            tilda_Wk = pk*muW_ + (1-pk.pow(2))*(pk*torch.sqrt(sigmaZ_)/(torch.sqrt(sigmaW_)+1e-7)*(Wk-muW_) + Zk*torch.sqrt(1-pk.pow(2)))
             sampler.append(tilda_Wk)
         tilda_W = torch.stack(sampler) # [K x N x Q x D]
         tilda_W = tilda_W.permute(1,3,0,2) # [N x D x K x Q]
@@ -78,6 +90,7 @@ class ChoiceNetRegression(nn.Module):
         reg_loss = (1e-5)*F.mse_loss(y, torch.gather(mu, 1, select))
         mdn_loss = MDNLoss(pi, mu, var, y)
         kl_loss = KL(p,pi)
+        #print(reg_loss, mdn_loss,kl_loss )
         return reg_loss + mdn_loss + kl_loss
 
     def sampler(self, x, n_samples=1):
